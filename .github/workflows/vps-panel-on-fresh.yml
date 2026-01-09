@@ -1,0 +1,123 @@
+name: 晨更作业cf wop
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 3 * * 1"  # 每周一凌晨3点 UTC 执行
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制更新（忽略版本检查）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: "latest"
+
+      - name: 安装依赖
+        run: |
+          npm install -g javascript-obfuscator
+          sudo apt-get update
+          sudo apt-get install -y jq curl unzip wget
+
+      - name: 环境变量设置
+        run: |
+          echo "REPO_URL=https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases" >> $GITHUB_ENV
+          echo "TARGET_FILE=worker.js" >> $GITHUB_ENV  # 调整为 worker.js 以匹配混淆逻辑；如果需要 zip，可修改为 worker.zip 并添加解压后混淆
+
+      - name: 检查与更新 Worker
+        id: update_worker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
+
+          log "☀️ 清晨启程，检查更新中…"
+
+          LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
+          log "本地版本：${LOCAL_VERSION:-无}"
+
+          log "请求最新 Release 信息…"
+          RESPONSE=$(curl -s --retry 5 --retry-delay 2 --max-time 30 \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "$REPO_URL")
+          if [ $? -ne 0 ]; then
+            log "❌ 无法访问 GitHub API"
+            exit 1
+          fi
+
+          TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name == "'"$TARGET_FILE"'") | .browser_download_url')
+
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "null" ]; then
+            log "❌ 获取版本号失败"
+            exit 1
+          fi
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            # 备用下载方式：从 repo 下载文件（假设文件在 repo 根目录）
+            DOWNLOAD_URL="https://github.com/bia-pain-bache/BPB-Worker-Panel/raw/${TAG_NAME}/${TARGET_FILE}"
+            log "⚠️ 未找到 Release 资产，使用 raw 文件下载 URL: $DOWNLOAD_URL"
+          fi
+
+          log "最新版本：$TAG_NAME"
+
+          FORCE_UPDATE="${{ github.event.inputs.force_update || 'false' }}"
+          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
+            log "✅ 已是最新版本，无需更新"
+            exit 0
+          fi
+
+          log "⬇️ 下载 $TARGET_FILE…"
+          wget -q --tries=5 --timeout=30 -O "origin.js" "$DOWNLOAD_URL"
+          if [ $? -ne 0 ]; then
+            log "❌ 下载失败"
+            exit 1
+          fi
+
+          # 如果是 zip，添加解压（当前假设 js；如果 zip，取消注释并调整）
+          # log "📦 解压中…"
+          # unzip -o "origin.js" > /dev/null  # 实际为 zip 时改名
+          # rm "origin.js"
+          # mv worker.js origin.js  # 假设 zip 内有 worker.js
+
+          log "🔒 混淆 JS 代码…"
+          javascript-obfuscator origin.js --output _worker.js \
+            --compact true \
+            --identifier-names-generator hexadecimal \
+            --rename-globals false \
+            --string-array false \
+            --transform-object-keys false \
+            --self-defending false \
+            --simplify true
+          echo "// Auto obfuscated at $(date -u)" >> _worker.js
+          rm origin.js
+
+          echo "$TAG_NAME" > version.txt
+          log "✨ 更新完成，当前版本：$TAG_NAME"
+
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: 提交同步结果
+        if: success()
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🔄 自动同步 Worker 版本: ${{ steps.update_worker.outputs.tag_name }}"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
